@@ -5,10 +5,26 @@ import threading
 import subprocess
 import json
 import sys
+import shutil
+import traceback
 from pathlib import Path
+from collections import deque
+from urllib.parse import urlparse
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk
+
+# -----------------------
+# Helper logging functions
+# -----------------------
+def _safe_idle(fn, *args):
+    """Call GLib.idle_add safely for UI updates"""
+    try:
+        return GLib.idle_add(fn, *args)
+    except Exception:
+        # worst-case: nothing we can do
+        return None
+
 
 class YtDlpGUI(Gtk.ApplicationWindow):
     FORMAT_OPTIONS = {
@@ -17,6 +33,9 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
     SUB_LANGS = [("en", "English"), ("all", "All Available"), ("es", "Spanish"),
                  ("fr", "French"), ("de", "German"), ("hi", "Hindi")]
+
+    # how many recent lines from yt-dlp to keep for debugging
+    RECENT_LINES = 400
 
     def __init__(self, app):
         super().__init__(application=app, title="yt-dlp GUI Manager")
@@ -27,15 +46,71 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.download_thread = None
         self.process = None
         self.available_formats = {}
+        self._recent_output = deque(maxlen=self.RECENT_LINES)
+
         self.setup_ui()
 
+    # ---------- logging helpers (all logs go to status view) ----------
+    def log(self, level, category, message, debug=None):
+        """
+        Generic logger for the status box.
+        level: INFO / WARN / ERROR / DEBUG
+        category: short tag like Network / yt-dlp / Parsing / Process
+        message: user-facing message
+        debug: optional dict or string with further diagnostic info
+        """
+        prefix = f"[{level}][{category}] "
+        lines = [prefix + message]
+        if debug:
+            if isinstance(debug, dict):
+                for k, v in debug.items():
+                    lines.append(f"[{level}][{category}][DEBUG]{k}: {v}")
+            else:
+                lines.append(f"[{level}][{category}][DEBUG] {str(debug)}")
+
+        # Add to recent output buffer for process debugging
+        for l in lines:
+            self._recent_output.append(l)
+
+        # Add to GUI in main thread
+        _safe_idle(self._append_status_lines, "\n".join(lines))
+
+    def log_info(self, category, message, debug=None):
+        self.log("INFO", category, message, debug)
+
+    def log_warn(self, category, message, debug=None):
+        self.log("WARN", category, message, debug)
+
+    def log_error(self, category, message, debug=None):
+        self.log("ERROR", category, message, debug)
+
+    def log_debug(self, category, message, debug=None):
+        # Put debug at DEBUG level; GUI still shows it but may be filtered by user mentally
+        self.log("DEBUG", category, message, debug)
+
+    def _append_status_lines(self, text):
+        """Append text to the status TextView (runs on main thread)."""
+        try:
+            text_buffer = self.status_view.get_buffer()
+            text_buffer.insert(text_buffer.get_end_iter(), text + "\n")
+            # scroll to end
+            insert_mark = text_buffer.get_insert()
+            try:
+                self.status_view.scroll_to_mark(insert_mark, 0.0, True, 0.0, 1.0)
+            except Exception:
+                end_iter = text_buffer.get_end_iter()
+                self.status_view.scroll_to_iter(end_iter, 0.0, True, 0.0, 1.0)
+        except Exception:
+            # if logging itself fails, fallback to printing to stderr
+            print("Failed to append status lines:", text, file=sys.stderr)
+
+    # ---------- UI creation ----------
     def create_labeled_combo(self, label_text, options, active_id="best"):
         """Helper to create labeled comboboxes"""
         label = Gtk.Label(label=label_text, xalign=0)
         combo = Gtk.ComboBoxText()
         for opt_id, opt_label in options:
             combo.append(opt_id, opt_label)
-        # set_active_id may fail if active_id not present; guard it
         try:
             combo.set_active_id(active_id)
         except Exception:
@@ -47,7 +122,6 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         frame = Gtk.Frame(label=title)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
         for margin in ["top", "bottom", "start", "end"]:
-            # Use the typical GTK setter names
             getattr(box, f"set_margin_{margin}")(10)
         frame.add(box)
         return frame, box
@@ -186,6 +260,7 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.show_all()
         self.video_frame.hide()
 
+    # ---------- UI callbacks ----------
     def on_type_changed(self, combo):
         is_video = combo.get_active_id() == "video"
         self.video_frame.set_visible(is_video)
@@ -207,7 +282,18 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         """Fetch available formats from URL"""
         url = self.url_entry.get_text().strip()
         if not url:
-            self.show_error("Please enter a URL")
+            self.log_error("Input", "Please enter a URL")
+            return
+
+        # Validate URL minimally
+        if not self._looks_like_url(url):
+            self.log_error("Input", "URL does not look valid", {"url": url})
+            return
+
+        # Check yt-dlp presence
+        if not shutil.which("yt-dlp"):
+            self.log_error("yt-dlp", "yt-dlp not found on PATH. Install via: pip install yt-dlp",
+                           {"hint": "or add the path to yt-dlp binary to your PATH"})
             return
 
         self.fetch_btn.set_sensitive(False)
@@ -220,37 +306,71 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         """Thread to fetch available formats"""
         try:
             cmd = ["yt-dlp", "--list-formats", "-R", "5", url]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            out = result.stdout or ""
-            err = result.stderr or ""
-            GLib.idle_add(self.parse_formats, out, err)
-        except subprocess.TimeoutExpired as te:
-            GLib.idle_add(self.show_error, f"Timeout fetching formats: {te}")
+            self.log_info("yt-dlp", "Running format-list command", {"cmd": " ".join(cmd)})
+            try:
+                # run with timeout and capture both stdout/stderr
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired as te:
+                # Provide debug info
+                debug = {
+                    "cmd": " ".join(cmd),
+                    "timeout": 30,
+                    "exception": str(te)
+                }
+                self.log_error("Network", "Timeout fetching formats", debug)
+                return
+
+            stdout = result.stdout or ""
+            stderr = result.stderr or ""
+            rc = result.returncode
+            debug_info = {"returncode": rc, "cmd": " ".join(cmd)}
+            if stderr.strip():
+                debug_info["stderr_tail"] = stderr.strip()[-1000:]  # last part for brevity
+                self.log_debug("yt-dlp", "stderr present while listing formats", {"stderr": stderr.strip()[:1000]})
+
+            if rc != 0:
+                # non-zero exit: log error with stdout/stderr context
+                debug_info["stdout_tail"] = stdout.strip()[-1000:]
+                self.log_error("yt-dlp", f"yt-dlp exited with code {rc} while listing formats", debug_info)
+                # still attempt to parse whatever stdout we have (some useful info may be printed)
+                GLib.idle_add(self.parse_formats, stdout, stderr)
+                return
+
+            # success -> parse
+            GLib.idle_add(self.parse_formats, stdout, stderr)
+
         except FileNotFoundError:
-            GLib.idle_add(self.show_error, "yt-dlp not found. Install: pip install yt-dlp")
+            self.log_error("yt-dlp", "yt-dlp binary not found. Install: pip install yt-dlp", {"cmd": "yt-dlp"})
         except Exception as e:
-            GLib.idle_add(self.show_error, f"Error fetching formats: {str(e)}")
+            tb = traceback.format_exc(limit=3)
+            self.log_error("Fetch", "Unexpected error while fetching formats",
+                           {"exception": str(e), "traceback": tb})
         finally:
             # Re-enable button and restore label on the main thread
-            GLib.idle_add(self.fetch_btn.set_sensitive, True)
-            GLib.idle_add(self.fetch_btn.set_label, "Fetch Formats")
+            _safe_idle(self.fetch_btn.set_sensitive, True)
+            _safe_idle(self.fetch_btn.set_label, "Fetch Formats")
 
     def parse_formats(self, stdout, stderr):
         """Parse yt-dlp format output"""
         self.available_formats.clear()
-        self.v_format_combo.remove_all()
+        try:
+            self.v_format_combo.remove_all()
+        except Exception:
+            # ignore GUI removal errors
+            pass
 
         try:
             # If stderr contains info, log it
             if stderr and stderr.strip():
-                self.log_status("[yt-dlp stderr] " + stderr.strip())
+                self.log_debug("yt-dlp", "stderr returned during format listing", {"stderr": stderr.strip()[:2000]})
 
             lines = stdout.splitlines()
             in_formats = False
+            formats_found = 0
 
             for line in lines:
                 lower = line.lower()
-                if "format code" in lower or line.strip().startswith("format code"):
+                if "format code" in lower or line.strip().lower().startswith("format code"):
                     in_formats = True
                     continue
 
@@ -263,33 +383,43 @@ class YtDlpGUI(Gtk.ApplicationWindow):
                     if len(parts) >= 1:
                         format_code = parts[0]
                         format_info = " ".join(parts[1:]) if len(parts) > 1 else ""
-                        # store and add
-                        # avoid duplicate keys by ensuring unique keys in the combo (yt-dlp format codes are usually unique)
                         key = format_code
                         suffix = format_info[:60] + ("..." if len(format_info) > 60 else "")
+                        # ensure unique keys (append suffix count if needed)
+                        if key in self.available_formats:
+                            # make unique - append a suffix
+                            i = 1
+                            while f"{key}_{i}" in self.available_formats:
+                                i += 1
+                            key = f"{key}_{i}"
                         self.available_formats[key] = format_info
-                        # append in GUI
-                        self.v_format_combo.append(key, f"{key} - {suffix}")
+                        try:
+                            self.v_format_combo.append(key, f"{format_code} - {suffix}")
+                        except Exception:
+                            # ignore append GUI errors but keep memory entry
+                            pass
+                        formats_found += 1
 
-            if self.available_formats:
+            if formats_found:
                 first_key = next(iter(self.available_formats.keys()))
                 try:
                     self.v_format_combo.set_active_id(first_key)
                 except Exception:
                     pass
-                self.log_status(f"[INFO] Found {len(self.available_formats)} available formats")
+                self.log_info("Parsing", f"Found {formats_found} available formats")
             else:
                 # fallback: try to append 'best'
-                self.log_status("[ERROR] No formats found in output")
-                self.v_format_combo.append("best", "Unable to parse formats")
+                self.log_warn("Parsing", "No formats found in yt-dlp output", {"stdout_len": len(stdout), "stderr_len": len(stderr)})
                 try:
+                    self.v_format_combo.append("best", "Unable to parse formats")
                     self.v_format_combo.set_active_id("best")
                 except Exception:
                     pass
         except Exception as e:
-            self.log_status(f"[ERROR] Failed to parse formats: {str(e)}")
-            self.v_format_combo.append("best", "Error fetching formats")
+            tb = traceback.format_exc(limit=3)
+            self.log_error("Parsing", "Failed to parse formats", {"exception": str(e), "traceback": tb})
             try:
+                self.v_format_combo.append("best", "Error fetching formats")
                 self.v_format_combo.set_active_id("best")
             except Exception:
                 pass
@@ -306,32 +436,35 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             self.location_entry.set_text(dialog.get_filename())
         dialog.destroy()
 
-    def log_status(self, message):
-        text_buffer = self.status_view.get_buffer()
-        # insert at end
-        text_buffer.insert(text_buffer.get_end_iter(), message + "\n")
-        # scroll to the insert mark so newly added text is visible
-        insert_mark = text_buffer.get_insert()
+    def _append_recent_output_debug(self):
+        """Return a string with recent output lines for debugging."""
         try:
-            # scroll_to_mark(widget, mark, within_margin, use_align, xalign, yalign)
-            self.status_view.scroll_to_mark(insert_mark, 0.0, True, 0.0, 1.0)
+            return "\n".join(list(self._recent_output)[-200:])
         except Exception:
-            # best-effort fallback: get end iter and move cursor
-            end_iter = text_buffer.get_end_iter()
-            self.status_view.scroll_to_iter(end_iter, 0.0, True, 0.0, 1.0)
+            return ""
 
     def on_clear_log(self, button):
         text_buffer = self.status_view.get_buffer()
         text_buffer.set_text("")
+        self._recent_output.clear()
 
     def on_download_clicked(self, button):
         url = self.url_entry.get_text().strip()
         if not url:
-            self.show_error("Please enter a URL")
+            self.log_error("Input", "Please enter a URL")
             return
 
-        if not self.available_formats and self.type_combo.get_active_id() == "video":
-            self.show_error("Please fetch formats first by clicking 'Fetch Formats'")
+        # Validate URL minimally
+        if not self._looks_like_url(url):
+            self.log_error("Input", "URL does not look valid", {"url": url})
+            return
+
+        if self.type_combo.get_active_id() == "video" and not self.available_formats:
+            self.log_warn("Usage", "No formats are available — fetching formats is recommended before downloading.")
+
+        # Check yt-dlp presence
+        if not shutil.which("yt-dlp"):
+            self.log_error("yt-dlp", "yt-dlp not found on PATH. Install via: pip install yt-dlp")
             return
 
         self.download_thread = threading.Thread(target=self.start_download, args=(url,), daemon=True)
@@ -341,12 +474,16 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         if self.process:
             try:
                 self.process.terminate()
-            except Exception:
+                self.log_info("Process", "Sent terminate() to process")
+            except Exception as e:
+                self.log_warn("Process", "Failed to terminate gracefully; attempting kill", {"exception": str(e)})
                 try:
                     self.process.kill()
-                except Exception:
-                    pass
-            GLib.idle_add(self.log_status, "[CANCELLED] Download stopped by user")
+                except Exception as e2:
+                    self.log_error("Process", "Failed to kill process", {"exception": str(e2)})
+            _safe_idle(self.log_info, "Process", "Download stop requested by user")
+        else:
+            self.log_warn("Process", "No active process to cancel")
 
     def build_cmd(self, url):
         """Build yt-dlp command based on settings"""
@@ -390,64 +527,92 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         return cmd
 
     def start_download(self, url):
-        GLib.idle_add(self.log_status, f"Starting download from: {url}")
-        GLib.idle_add(self.progress_bar.set_fraction, 0.0)
+        self.log_info("Download", f"Starting download from: {url}")
+        _safe_idle(self.progress_bar.set_fraction, 0.0)
+        self._recent_output.clear()
 
         try:
             cmd = self.build_cmd(url)
-            GLib.idle_add(self.log_status, f"Command: {' '.join(cmd)}")
+            cmd_str = " ".join(cmd)
+            self.log_debug("Download", "Command", {"cmd": cmd_str})
+
             # Start process
+            # We'll combine stdout and stderr to a single stream (keeps live logging simple)
             self.process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 universal_newlines=True, bufsize=1
             )
 
             has_error = False
-            # Read stdout line-by-line
+            # Read stdout line-by-line and keep recent lines for debug
             for raw_line in self.process.stdout:
+                if raw_line is None:
+                    continue
                 line = raw_line.rstrip()
-                GLib.idle_add(self.log_status, line)
-
-                if line.startswith("ERROR") or "error" in line.lower():
+                # keep recent lines
+                self._recent_output.append(line)
+                _safe_idle(self.log_info, "yt-dlp", line)
+                # error heuristics
+                low = line.lower()
+                if low.startswith("error") or "error:" in low or "failed" in low:
                     has_error = True
 
-                # Try parsing progress lines containing '%' and 'ETA'
-                if "%" in line and "ETA" in line:
+                # Try parsing progress lines containing '%' and 'eta'
+                if "%" in line and "eta" in low:
                     try:
-                        # extract last token like '12.3%' or '12%'
-                        part = line.split("%")[0].split()[-1]
-                        percent = float(part)
-                        GLib.idle_add(self.progress_bar.set_fraction, min(percent / 100.0, 1.0))
-                    except (ValueError, IndexError):
+                        # extract the last token like '12.3%' or '12%'
+                        # fallback: find a token with '%' and strip it
+                        tokens = line.split()
+                        pct_token = None
+                        for t in reversed(tokens):
+                            if "%" in t:
+                                pct_token = t
+                                break
+                        if pct_token:
+                            # remove trailing non-digit chars
+                            val = "".join(ch for ch in pct_token if (ch.isdigit() or ch == "." or ch == ","))
+                            val = val.replace(",", ".")
+                            percent = float(val)
+                            _safe_idle(self.progress_bar.set_fraction, min(percent / 100.0, 1.0))
+                    except Exception:
                         pass
 
-            self.process.wait()
-            if self.process.returncode == 0 and not has_error:
-                GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
-                GLib.idle_add(self.progress_bar.set_fraction, 1.0)
+            # wait and inspect return code
+            rc = self.process.wait()
+            recent_out = "\n".join(list(self._recent_output)[-200:])
+            if rc == 0 and not has_error:
+                _safe_idle(self.log_info, "Download", "[SUCCESS] Download completed!")
+                _safe_idle(self.progress_bar.set_fraction, 1.0)
             else:
-                GLib.idle_add(self.log_status, "[FAILED] Download encountered errors. Check output above.")
-                GLib.idle_add(self.progress_bar.set_fraction, 0.0)
+                debug = {"returncode": rc, "recent_output_tail": recent_out[-3000:]}
+                self.log_error("Download", "[FAILED] Download encountered errors. Check recent output above.", debug)
+                _safe_idle(self.progress_bar.set_fraction, 0.0)
 
         except FileNotFoundError:
-            GLib.idle_add(self.show_error, "yt-dlp not found. Install: pip install yt-dlp")
+            self.log_error("yt-dlp", "yt-dlp not found. Install: pip install yt-dlp", {"cmd": "yt-dlp"})
         except Exception as e:
-            GLib.idle_add(self.show_error, f"Error: {str(e)}")
+            tb = traceback.format_exc(limit=5)
+            self.log_error("Download", "Unexpected exception during download", {"exception": str(e), "traceback": tb})
         finally:
-            self.process = None
+            # cleanup
+            try:
+                self.process = None
+            except Exception:
+                self.process = None
 
-    def show_error(self, message):
-        # Use a dialog and also log the error
-        dialog = Gtk.MessageDialog(
-            transient_for=self, flags=0,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK, text=message
-        )
-        dialog.run()
-        dialog.destroy()
-        self.log_status(f"[ERROR] {message}")
+    def _looks_like_url(self, url):
+        """Very-small heuristic to validate URL (not strict)."""
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https"):
+                return False
+            if not parsed.netloc:
+                return False
+            return True
+        except Exception:
+            return False
 
-
+# ---------- Application ----------
 class YtDlpApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id="com.xfce.ytdlp")
@@ -461,5 +626,4 @@ class YtDlpApp(Gtk.Application):
 
 if __name__ == "__main__":
     app = YtDlpApp()
-    # pass sys.argv to run() for better behavior with CLI args if any
     app.run(sys.argv)
