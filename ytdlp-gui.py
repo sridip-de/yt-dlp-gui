@@ -246,10 +246,11 @@ class YtDlpGUI(Gtk.ApplicationWindow):
                 cmd.append("--embed-thumbnail")
         else:
             quality = self.quality_combo.get_active_id()
+            # Use bestvideo[height<=X]+bestaudio/best for better compatibility
             if quality == "best":
-                cmd.extend(["-f", "bv*+ba/b"])
+                cmd.extend(["-f", "bestvideo+bestaudio/best"])
             else:
-                cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])
+                cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
             
             v_format = self.v_format_combo.get_active_id()
             if v_format != "best":
