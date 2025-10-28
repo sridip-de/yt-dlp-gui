@@ -3,20 +3,14 @@ import gi
 import os
 import threading
 import subprocess
+import json
 from pathlib import Path
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk
 
 class YtDlpGUI(Gtk.ApplicationWindow):
-    QUALITY_OPTIONS = {
-        "video": [("best", "Best Available"), ("1080", "1080p"), ("720", "720p"), 
-                  ("480", "480p"), ("360", "360p")],
-        "audio": [("best", "Best Available"), ("192", "192 kbps"), ("128", "128 kbps"), ("64", "64 kbps")]
-    }
-    
     FORMAT_OPTIONS = {
-        "video": [("best", "Best (auto)"), ("mp4", "MP4"), ("mkv", "MKV"), ("webm", "WebM")],
         "audio": [("best", "Best (auto)"), ("mp3", "MP3"), ("m4a", "M4A"), ("wav", "WAV"), ("opus", "Opus")]
     }
     
@@ -25,12 +19,13 @@ class YtDlpGUI(Gtk.ApplicationWindow):
     
     def __init__(self, app):
         super().__init__(application=app, title="yt-dlp GUI Manager")
-        self.set_default_size(700, 850)
+        self.set_default_size(800, 900)
         self.set_border_width(10)
         self.set_icon_name("application-x-executable")
         
         self.download_thread = None
         self.process = None
+        self.available_formats = {}
         self.setup_ui()
         
     def create_labeled_combo(self, label_text, options, active_id="best"):
@@ -57,10 +52,15 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         
         # URL Input
         url_label = Gtk.Label(label="URL:", xalign=0)
+        url_box = Gtk.Box(spacing=5)
         self.url_entry = Gtk.Entry()
         self.url_entry.set_placeholder_text("Enter YouTube URL...")
+        self.fetch_btn = Gtk.Button(label="Fetch Formats")
+        self.fetch_btn.connect("clicked", self.on_fetch_formats)
+        url_box.pack_start(self.url_entry, True, True, 0)
+        url_box.pack_start(self.fetch_btn, False, False, 0)
         main_box.pack_start(url_label, False, False, 0)
-        main_box.pack_start(self.url_entry, False, False, 0)
+        main_box.pack_start(url_box, False, False, 0)
         
         # Download Type Selection
         type_label = Gtk.Label(label="Download Type:", xalign=0)
@@ -81,25 +81,24 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         # Video Settings Frame
         self.video_frame, video_box = self.create_frame("Video Settings")
         
-        v_quality_label, self.quality_combo = self.create_labeled_combo(
-            "Quality:", self.QUALITY_OPTIONS["video"], "best")
-        video_box.pack_start(v_quality_label, False, False, 0)
-        video_box.pack_start(self.quality_combo, False, False, 0)
-        
-        v_format_label, self.v_format_combo = self.create_labeled_combo(
-            "Video Format:", self.FORMAT_OPTIONS["video"], "best")
+        v_format_label = Gtk.Label(label="Available Format:", xalign=0)
+        self.v_format_combo = Gtk.ComboBoxText()
+        self.v_format_combo.append("best", "Loading... (fetch URL first)")
+        self.v_format_combo.set_active_id("best")
         video_box.pack_start(v_format_label, False, False, 0)
         video_box.pack_start(self.v_format_combo, False, False, 0)
+        
+        # Format info display
+        self.format_info_label = Gtk.Label(label="Select a format to see details", xalign=0, wrap=True)
+        self.format_info_label.set_line_wrap(True)
+        video_box.pack_start(self.format_info_label, False, False, 0)
+        
+        self.v_format_combo.connect("changed", self.on_video_format_changed)
         
         main_box.pack_start(self.video_frame, False, False, 0)
         
         # Audio Settings Frame
         audio_frame, audio_box = self.create_frame("Audio Settings")
-        
-        a_quality_label, self.a_quality_combo = self.create_labeled_combo(
-            "Audio Quality:", self.QUALITY_OPTIONS["audio"], "best")
-        audio_box.pack_start(a_quality_label, False, False, 0)
-        audio_box.pack_start(self.a_quality_combo, False, False, 0)
         
         a_format_label, self.a_format_combo = self.create_labeled_combo(
             "Audio Format:", self.FORMAT_OPTIONS["audio"], "best")
@@ -164,9 +163,12 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         download_btn.connect("clicked", self.on_download_clicked)
         cancel_btn = Gtk.Button(label="Cancel")
         cancel_btn.connect("clicked", self.on_cancel_clicked)
+        clear_btn = Gtk.Button(label="Clear Log")
+        clear_btn.connect("clicked", self.on_clear_log)
         
         button_box.pack_start(download_btn, True, True, 0)
         button_box.pack_start(cancel_btn, True, True, 0)
+        button_box.pack_start(clear_btn, True, True, 0)
         
         main_box.pack_end(button_box, False, False, 0)
         
@@ -182,6 +184,81 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         is_active = check.get_active()
         self.sub_lang_combo.set_sensitive(is_active)
         self.embed_sub_check.set_sensitive(is_active and self.type_combo.get_active_id() == "video")
+    
+    def on_video_format_changed(self, combo):
+        """Update format info when selection changes"""
+        format_id = combo.get_active_id()
+        if format_id in self.available_formats:
+            info = self.available_formats[format_id]
+            self.format_info_label.set_text(info)
+    
+    def on_fetch_formats(self, button):
+        """Fetch available formats from URL"""
+        url = self.url_entry.get_text().strip()
+        if not url:
+            self.show_error("Please enter a URL")
+            return
+        
+        self.fetch_btn.set_sensitive(False)
+        self.fetch_btn.set_label("Fetching...")
+        
+        fetch_thread = threading.Thread(target=self.fetch_formats_thread, args=(url,), daemon=True)
+        fetch_thread.start()
+    
+    def fetch_formats_thread(self, url):
+        """Thread to fetch available formats"""
+        try:
+            cmd = ["yt-dlp", "--list-formats", "-R", "5", url]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            GLib.idle_add(self.parse_formats, result.stdout, result.stderr)
+        except Exception as e:
+            GLib.idle_add(self.show_error, f"Error fetching formats: {str(e)}")
+        finally:
+            GLib.idle_add(lambda: self.fetch_btn.set_sensitive(True))
+            GLib.idle_add(lambda: self.fetch_btn.set_label("Fetch Formats"))
+    
+    def parse_formats(self, stdout, stderr):
+        """Parse yt-dlp format output"""
+        self.available_formats.clear()
+        
+        # Clear existing items
+        self.v_format_combo.remove_all()
+        
+        try:
+            lines = stdout.split('\n')
+            in_formats = False
+            
+            for line in lines:
+                if 'format code' in line.lower():
+                    in_formats = True
+                    continue
+                
+                if in_formats and line.strip():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        format_code = parts[0]
+                        # Get resolution/codec info
+                        format_info = ' '.join(parts[1:])
+                        
+                        # Store full info
+                        self.available_formats[format_code] = format_info
+                        # Add to combo
+                        self.v_format_combo.append(format_code, f"{format_code} - {format_info[:60]}...")
+            
+            if self.available_formats:
+                # Select first format
+                first_key = list(self.available_formats.keys())[0]
+                self.v_format_combo.set_active_id(first_key)
+                self.log_status(f"[INFO] Found {len(self.available_formats)} available formats")
+            else:
+                self.log_status("[ERROR] No formats found in output")
+                self.v_format_combo.append("best", "Unable to parse formats")
+                self.v_format_combo.set_active_id("best")
+        except Exception as e:
+            self.log_status(f"[ERROR] Failed to parse formats: {str(e)}")
+            self.v_format_combo.append("best", "Error fetching formats")
+            self.v_format_combo.set_active_id("best")
     
     def on_browse_clicked(self, button):
         dialog = Gtk.FileChooserDialog(
@@ -201,10 +278,18 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         text_buffer.insert(text_buffer.get_end_iter(), message + "\n")
         self.status_view.scroll_mark_onscreen(text_buffer.get_insert())
     
+    def on_clear_log(self, button):
+        text_buffer = self.status_view.get_buffer()
+        text_buffer.delete(text_buffer.get_start_iter(), text_buffer.get_end_iter())
+    
     def on_download_clicked(self, button):
         url = self.url_entry.get_text().strip()
         if not url:
             self.show_error("Please enter a URL")
+            return
+        
+        if not self.available_formats:
+            self.show_error("Please fetch formats first by clicking 'Fetch Formats'")
             return
         
         self.download_thread = threading.Thread(target=self.start_download, args=(url,), daemon=True)
@@ -219,13 +304,12 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         """Build yt-dlp command based on settings"""
         cmd = ["yt-dlp"]
         
-        # Add necessary options for reliability
         cmd.extend([
             "--no-warnings",
             "-R", "10",
             "--socket-timeout", "30",
             "--extractor-args", "youtube:player_client=web,youtube:ignore_consent_challenge=true",
-            "--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
         ])
         
         if self.playlist_check.get_active():
@@ -239,22 +323,12 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             audio_format = self.a_format_combo.get_active_id()
             if audio_format != "best":
                 cmd.extend(["--audio-format", audio_format])
-            audio_quality = self.a_quality_combo.get_active_id()
-            if audio_quality != "best":
-                cmd.extend(["--audio-quality", audio_quality])
             if self.thumbnail_check.get_active():
                 cmd.append("--embed-thumbnail")
         else:
-            quality = self.quality_combo.get_active_id()
-            # Use bestvideo[height<=X]+bestaudio/best for better compatibility
-            if quality == "best":
-                cmd.extend(["-f", "bestvideo+bestaudio/best"])
-            else:
-                cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
-            
-            v_format = self.v_format_combo.get_active_id()
-            if v_format != "best":
-                cmd.extend(["--merge-output-format", v_format])
+            # Use selected format from dropdown
+            selected_format = self.v_format_combo.get_active_id()
+            cmd.extend(["-f", selected_format])
         
         if self.subtitle_check.get_active():
             cmd.append("--write-subs")
