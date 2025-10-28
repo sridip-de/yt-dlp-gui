@@ -4,6 +4,7 @@ import threading
 import subprocess
 import os
 import sys
+import re
 from pathlib import Path
 
 gi.require_version("Gtk", "3.0")
@@ -20,6 +21,7 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.download_thread = None
         self.available_formats = {}
         self.is_video_mode = True
+        self.all_formats = []  # Store all fetched formats
 
         self.setup_ui()
 
@@ -114,7 +116,34 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
     # ---------------- EVENT HANDLERS ----------------
     def on_type_changed(self, combo):
+        """Update dropdown when type changes"""
         self.is_video_mode = combo.get_active_id() == "video"
+        self.update_format_dropdown_by_type()
+
+    def update_format_dropdown_by_type(self):
+        """Filter and update dropdown based on selected type"""
+        self.v_format_combo.remove_all()
+        
+        if not self.all_formats:
+            self.v_format_combo.append("none", "Fetch a URL first...")
+            self.v_format_combo.set_active_id("none")
+            return
+        
+        if self.is_video_mode:
+            filtered = [fmt for fmt in self.all_formats if fmt['type'] == 'video']
+            label_text = "Video Formats"
+        else:
+            filtered = [fmt for fmt in self.all_formats if fmt['type'] == 'audio']
+            label_text = "Audio Formats"
+        
+        if not filtered:
+            self.v_format_combo.append("none", f"No {label_text.lower()} found")
+            self.v_format_combo.set_active_id("none")
+            return
+        
+        for fmt in filtered:
+            self.v_format_combo.append(fmt['id'], fmt['label'])
+        self.v_format_combo.set_active(0)
 
     def on_browse_clicked(self, button):
         dialog = Gtk.FileChooserDialog(
@@ -176,8 +205,9 @@ class YtDlpGUI(Gtk.ApplicationWindow):
                 return
 
             parsed = self.parse_formats(stdout)
-            GLib.idle_add(self.update_format_combo, parsed)
-            GLib.idle_add(self.log_status, f"[INFO] Found {len(parsed)} formats")
+            self.all_formats = parsed
+            GLib.idle_add(self.update_format_dropdown_by_type)
+            GLib.idle_add(self.log_status, f"[INFO] Found {len(parsed)} total formats")
 
         except subprocess.TimeoutExpired:
             GLib.idle_add(self.log_status, "[ERROR] Timeout fetching formats")
@@ -190,31 +220,101 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             GLib.idle_add(self.fetch_btn.set_label, "Fetch Formats")
 
     def parse_formats(self, output):
-        """Parse yt-dlp --list-formats raw output"""
+        """
+        Parse yt-dlp --list-formats output with robust format detection.
+        Returns list of dicts with keys: id, label, type (video/audio)
+        """
         lines = output.splitlines()
         formats = []
-        start = False
+        in_format_section = False
+        
         for line in lines:
-            if "format code" in line.lower():
-                start = True
+            # Look for the format header line
+            if "format code" in line.lower() or "ID" in line and "EXT" in line:
+                in_format_section = True
                 continue
-            if start and line.strip():
-                parts = line.split(maxsplit=1)
-                if len(parts) >= 1:
-                    code = parts[0]
-                    desc = parts[1] if len(parts) > 1 else ""
-                    formats.append((code, f"{code} - {desc.strip()}"))
+            
+            if not in_format_section or not line.strip():
+                continue
+            
+            # Skip lines that don't start with format codes (usually end up being description lines)
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # Try to parse format line
+            # Format: ID  EXT  RESOLUTION FPS CH   FILESIZE   TBR  PROTO  VCODEC  ACODEC  MORE INFO
+            parts = line_stripped.split()
+            
+            if len(parts) < 2:
+                continue
+            
+            fmt_id = parts[0]
+            
+            # Skip non-format lines (IDs are typically numbers or common codes like "best", "worst")
+            # But we want to include those too
+            if not (fmt_id[0].isdigit() or fmt_id in ["best", "worst", "bestvideo", "bestaudio"]):
+                # Try alternative: might be a description line, skip it
+                if not re.match(r'^[0-9a-zA-Z_]+$', fmt_id):
+                    continue
+            
+            ext = parts[1] if len(parts) > 1 else "unknown"
+            
+            # Determine format type based on description content
+            fmt_type = self.determine_format_type(line_stripped)
+            
+            if fmt_type is None:
+                continue
+            
+            # Create readable label
+            label = f"{fmt_id} - {ext.upper()}"
+            
+            # Add resolution/bitrate info if available
+            for i, part in enumerate(parts[2:6]):
+                if part and part[0].isdigit():
+                    label += f" - {part}"
+            
+            formats.append({
+                'id': fmt_id,
+                'label': label,
+                'type': fmt_type,
+                'ext': ext
+            })
+        
         return formats
 
-    def update_format_combo(self, formats):
-        self.v_format_combo.remove_all()
-        if not formats:
-            self.v_format_combo.append("none", "No formats found")
-            self.v_format_combo.set_active_id("none")
-            return
-        for fmt_id, fmt_label in formats:
-            self.v_format_combo.append(fmt_id, fmt_label)
-        self.v_format_combo.set_active(0)
+    def determine_format_type(self, line):
+        """
+        Determine if format is video or audio based on line content.
+        """
+        line_lower = line.lower()
+        
+        # Look for audio indicators
+        if "audio only" in line_lower:
+            return "audio"
+        
+        # Look for video indicators
+        if any(x in line_lower for x in ["1080p", "720p", "480p", "360p", "240p", "144p", "x"]):
+            return "video"
+        
+        # Check for codec indicators
+        if "vp9" in line_lower or "h.264" in line_lower or "h264" in line_lower or "avc" in line_lower:
+            return "video"
+        
+        if "opus" in line_lower or "aac" in line_lower or "vorbis" in line_lower or "mp3" in line_lower:
+            return "audio"
+        
+        # Check for video/audio keywords in description
+        if "video" in line_lower and "audio" not in line_lower:
+            return "video"
+        if "audio" in line_lower:
+            return "audio"
+        
+        # Default: if it has high numbers, likely video
+        if re.search(r'\d{3,4}x\d{3,4}', line):  # resolution pattern
+            return "video"
+        
+        return None
 
     # ---------------- DOWNLOAD ----------------
     def on_download_clicked(self, button):
@@ -231,15 +331,8 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         location = self.location_entry.get_text().strip() or str(Path.home() / "Downloads")
 
         fmt_id = self.v_format_combo.get_active_id()
-        if self.is_video_mode:
-            if fmt_id and fmt_id != "none" and fmt_id != "loading":
-                cmd += ["-f", fmt_id]
-        else:
-            cmd += ["-x"]
-            if fmt_id and fmt_id not in ("none", "loading", "best"):
-                cmd += ["--audio-format", fmt_id]
-            if self.thumb_check.get_active():
-                cmd.append("--embed-thumbnail")
+        if fmt_id and fmt_id not in ("none", "loading"):
+            cmd += ["-f", fmt_id]
 
         if self.subs_check.get_active():
             cmd.append("--write-subs")
@@ -247,6 +340,9 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             cmd.append("--embed-subs")
         if self.playlist_check.get_active():
             cmd.append("-i")
+
+        if not self.is_video_mode and self.thumb_check.get_active():
+            cmd.append("--embed-thumbnail")
 
         cmd += ["-o", os.path.join(location, "%(title)s.%(ext)s"), url]
         return cmd
