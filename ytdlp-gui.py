@@ -169,8 +169,13 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             except Exception as e:
                 self.log_status(f"[ERROR][Cancel] {e}")
 
-    def log_status(self, message):
+    def log_status(self, message, replace_last=False):
         buf = self.status_view.get_buffer()
+        if replace_last:
+            # Remove last line and replace it
+            end = buf.get_end_iter()
+            start = buf.get_iter_at_line(buf.get_line_count() - 1)
+            buf.delete(start, end)
         end = buf.get_end_iter()
         buf.insert(end, message + "\n")
         self.status_view.scroll_to_iter(buf.get_end_iter(), 0.0, True, 0.0, 1.0)
@@ -359,13 +364,15 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             )
 
             for line in self.process.stdout:
-                GLib.idle_add(self.log_status, line.rstrip())
                 if "%" in line and "ETA" in line:
                     try:
                         percent = float(line.split("%")[0].split()[-1])
                         GLib.idle_add(self.progress_bar.set_fraction, min(percent / 100, 1.0))
+                        GLib.idle_add(self.log_status, line.rstrip(), True)
                     except Exception:
-                        pass
+                        GLib.idle_add(self.log_status, line.rstrip())
+                else:
+                    GLib.idle_add(self.log_status, line.rstrip())
 
             self.process.wait()
             if self.process.returncode == 0:
