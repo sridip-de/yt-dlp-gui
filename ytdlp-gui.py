@@ -4,10 +4,6 @@ import os
 import threading
 import subprocess
 from pathlib import Path
-try:
-    import yt_dlp
-except Exception:
-    yt_dlp = None
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, GLib, Gdk
@@ -215,92 +211,35 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.download_thread.start()
     
     def on_cancel_clicked(self, button):
-        # Support cancelling both API and subprocess downloads
-        self._cancel_requested = True
         if self.process:
-            try:
-                self.process.terminate()
-            except Exception:
-                pass
-        GLib.idle_add(self.log_status, "[CANCELLED] Download stopped by user")
+            self.process.terminate()
+            GLib.idle_add(self.log_status, "[CANCELLED] Download stopped by user")
     
     def build_cmd(self, url):
-        """Return a tuple (use_api, api_opts, cmd_fallback).
-
-        use_api: boolean whether we can use the yt_dlp Python package.
-        api_opts: options dict suitable for yt_dlp.YoutubeDL
-        cmd_fallback: list of args to call external `yt-dlp` if package missing.
-        """
-        # common vars
-        download_type = self.type_combo.get_active_id()
-        location = self.location_entry.get_text()
-
-        # default http headers to reduce 403 responses
-        http_headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9'
-        }
-
-        ydl_opts = {
-            'outtmpl': f"{location}/%(title)s.%(ext)s",
-            'noplaylist': not self.playlist_check.get_active(),
-            'retries': 5,
-            'socket_timeout': 30,
-            'no_warnings': True,
-            'http_chunk_size': 1048576,
-            'http_headers': http_headers,
-            'extractor_args': {'youtube': {'player_client': 'web'}},
-            # progress hook will be attached at call site
-        }
-
-        # subtitles
-        if self.subtitle_check.get_active():
-            ydl_opts['writesubtitles'] = True
-            sub_lang = self.sub_lang_combo.get_active_id()
-            if sub_lang and sub_lang != 'all':
-                ydl_opts['subtitleslangs'] = [sub_lang]
-            if self.embed_sub_check.get_active() and download_type == 'video':
-                ydl_opts['embedsubtitles'] = True
-
-        if download_type == 'audio':
-            # extract audio
-            ydl_opts['format'] = 'bestaudio/best'
-            audio_format = self.a_format_combo.get_active_id()
-            if audio_format != 'best':
-                ydl_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': audio_format,
-                    'preferredquality': self.a_quality_combo.get_active_id() if self.a_quality_combo.get_active_id() != 'best' else '192'
-                }]
-            if self.thumbnail_check.get_active():
-                ydl_opts.setdefault('postprocessors', []).append({'key': 'EmbedThumbnail'})
-        else:
-            # video
-            quality = self.quality_combo.get_active_id()
-            if quality == 'best':
-                ydl_opts['format'] = 'bv*+ba/b'
-            else:
-                try:
-                    # numeric like '720'
-                    int_q = int(quality)
-                    ydl_opts['format'] = f"bv*[height<={int_q}]+ba/b"
-                except Exception:
-                    ydl_opts['format'] = 'bv*+ba/b'
-            v_format = self.v_format_combo.get_active_id()
-            if v_format != 'best':
-                ydl_opts['merge_output_format'] = v_format
-
-        # build subprocess fallback command (keeps earlier behavior)
-        cmd = ["yt-dlp", "--no-warnings", "-R", "5", "--socket-timeout", "30", "--extractor-args", "youtube:player_client=web"]
+        """Build yt-dlp command based on settings"""
+        cmd = ["yt-dlp"]
+        
+        # Add necessary options for reliability
+        cmd.extend([
+            "--no-warnings",
+            "-R", "5",  # Retry 5 times
+            "--socket-timeout", "30",
+            "--extractor-args", "youtube:player_client=web"
+        ])
+        
         if self.playlist_check.get_active():
             cmd.append("-i")
-        if download_type == 'audio':
+        
+        download_type = self.type_combo.get_active_id()
+        location = self.location_entry.get_text()
+        
+        if download_type == "audio":
             cmd.append("-x")
             audio_format = self.a_format_combo.get_active_id()
-            if audio_format != 'best':
+            if audio_format != "best":
                 cmd.extend(["--audio-format", audio_format])
             audio_quality = self.a_quality_combo.get_active_id()
-            if audio_quality != 'best':
+            if audio_quality != "best":
                 cmd.extend(["--audio-quality", audio_quality])
             if self.thumbnail_check.get_active():
                 cmd.append("--embed-thumbnail")
@@ -309,93 +248,56 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             if quality == "best":
                 cmd.extend(["-f", "bv*+ba/b"])
             else:
-                cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"]) 
+                cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])
+            
             v_format = self.v_format_combo.get_active_id()
             if v_format != "best":
                 cmd.extend(["--merge-output-format", v_format])
+        
         if self.subtitle_check.get_active():
             cmd.append("--write-subs")
             sub_lang = self.sub_lang_combo.get_active_id()
             cmd.extend(["--sub-langs", sub_lang])
             if self.embed_sub_check.get_active() and download_type == "video":
                 cmd.append("--embed-subs")
+        
         cmd.extend(["-o", f"{location}/%(title)s.%(ext)s", url])
-
-        return (yt_dlp is not None, ydl_opts, cmd)
+        return cmd
     
     def start_download(self, url):
         GLib.idle_add(self.log_status, f"Starting download from: {url}")
         GLib.idle_add(self.progress_bar.set_fraction, 0)
         
         try:
-            use_api, ydl_opts, cmd = self.build_cmd(url)
-
-            # reset cancel flag
-            self._cancel_requested = False
-
-            if use_api:
-                # attach a progress hook to update UI
-                def ydl_progress_hook(d):
+            cmd = self.build_cmd(url)
+            GLib.idle_add(self.log_status, f"Command: {' '.join(cmd)}")
+            self.process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True, bufsize=1
+            )
+            
+            has_error = False
+            for line in self.process.stdout:
+                line = line.rstrip()
+                GLib.idle_add(self.log_status, line)
+                
+                if line.startswith("ERROR"):
+                    has_error = True
+                
+                if "%" in line and "ETA" in line:
                     try:
-                        status = d.get('status')
-                        if getattr(self, '_cancel_requested', False):
-                            # Throw to stop download
-                            raise Exception('Download cancelled by user')
-
-                        if status == 'downloading':
-                            to_dl = d.get('total_bytes') or d.get('total_bytes_estimate')
-                            downloaded = d.get('downloaded_bytes', 0)
-                            if to_dl:
-                                frac = min(float(downloaded) / float(to_dl), 1.0)
-                                GLib.idle_add(self.progress_bar.set_fraction, frac)
-                                pct = f"{frac*100:5.1f}%"
-                                GLib.idle_add(self.log_status, f"[DOWNLOADING] {pct} - {d.get('filename', '')}")
-                            else:
-                                GLib.idle_add(self.log_status, f"[DOWNLOADING] {downloaded} bytes...")
-                        elif status == 'finished':
-                            GLib.idle_add(self.log_status, f"[PROCESSING] {d.get('filename', '')}")
-                    except Exception as e:
-                        # propagate to stop yt_dlp
-                        raise
-
-                ydl_opts['progress_hooks'] = [ydl_progress_hook]
-
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([url])
-                    GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
-                    GLib.idle_add(self.progress_bar.set_fraction, 1.0)
-                except Exception as e:
-                    GLib.idle_add(self.log_status, f"[FAILED] {str(e)}")
-                    GLib.idle_add(self.progress_bar.set_fraction, 0)
+                        percent = float(line.split("%")[0].split()[-1])
+                        GLib.idle_add(self.progress_bar.set_fraction, min(percent / 100, 1.0))
+                    except (ValueError, IndexError):
+                        pass
+            
+            self.process.wait()
+            if self.process.returncode == 0 and not has_error:
+                GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
+                GLib.idle_add(self.progress_bar.set_fraction, 1.0)
             else:
-                # fallback to external command
-                self.process = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    universal_newlines=True, bufsize=1
-                )
-                has_error = False
-                for line in self.process.stdout:
-                    line = line.rstrip()
-                    GLib.idle_add(self.log_status, line)
-
-                    if line.startswith("ERROR"):
-                        has_error = True
-
-                    if "%" in line and "ETA" in line:
-                        try:
-                            percent = float(line.split("%")[0].split()[-1])
-                            GLib.idle_add(self.progress_bar.set_fraction, min(percent / 100, 1.0))
-                        except (ValueError, IndexError):
-                            pass
-
-                self.process.wait()
-                if self.process.returncode == 0 and not has_error:
-                    GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
-                    GLib.idle_add(self.progress_bar.set_fraction, 1.0)
-                else:
-                    GLib.idle_add(self.log_status, "[FAILED] Download encountered errors. Check output above.")
-                    GLib.idle_add(self.progress_bar.set_fraction, 0)
+                GLib.idle_add(self.log_status, "[FAILED] Download encountered errors. Check output above.")
+                GLib.idle_add(self.progress_bar.set_fraction, 0)
             
         except FileNotFoundError:
             GLib.idle_add(self.show_error, "yt-dlp not found. Install: pip install yt-dlp")
