@@ -222,11 +222,10 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         # Add necessary options for reliability
         cmd.extend([
             "--no-warnings",
-            "-R", "10",  # Retry 10 times
+            "-R", "10",
             "--socket-timeout", "30",
             "--extractor-args", "youtube:player_client=web,youtube:ignore_consent_challenge=true",
-            "--http-header", "User-Agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            "--no-check-certificates"
+            "--user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ])
         
         if self.playlist_check.get_active():
