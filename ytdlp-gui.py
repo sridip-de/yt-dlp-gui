@@ -21,6 +21,7 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.download_thread = None
         self.all_formats = []
         self.is_video_mode = True
+        self.log_visible = True
 
         self.setup_ui()
 
@@ -88,12 +89,12 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.progress_bar = Gtk.ProgressBar()
         self.progress_bar.set_show_text(True)
         self.status_view = Gtk.TextView(editable=False)
-        scroll_win = Gtk.ScrolledWindow()
-        scroll_win.set_size_request(-1, 250)
-        scroll_win.add(self.status_view)
+        self.scroll_win = Gtk.ScrolledWindow()
+        self.scroll_win.set_size_request(-1, 250)
+        self.scroll_win.add(self.status_view)
         main_box.pack_start(progress_label, False, False, 0)
         main_box.pack_start(self.progress_bar, False, False, 0)
-        main_box.pack_start(scroll_win, True, True, 0)
+        main_box.pack_start(self.scroll_win, True, True, 0)
 
         # Buttons
         btn_box = Gtk.Box(spacing=10)
@@ -103,11 +104,15 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         cancel_btn.connect("clicked", self.on_cancel_clicked)
         clear_btn = Gtk.Button(label="Clear Log")
         clear_btn.connect("clicked", self.on_clear_log)
+        toggle_btn = Gtk.Button(label="Hide Log")
+        toggle_btn.connect("clicked", self.on_toggle_log_clicked)
         btn_box.pack_start(self.download_btn, True, True, 0)
         btn_box.pack_start(cancel_btn, True, True, 0)
         btn_box.pack_start(clear_btn, True, True, 0)
+        btn_box.pack_start(toggle_btn, True, True, 0)
         main_box.pack_start(btn_box, False, False, 0)
 
+        self.toggle_btn = toggle_btn
         self.show_all()
 
     # ----------------------- Event Handlers -----------------------
@@ -132,6 +137,17 @@ class YtDlpGUI(Gtk.ApplicationWindow):
     def on_clear_log(self, button):
         self.status_view.get_buffer().set_text("")
 
+    def on_toggle_log_clicked(self, button):
+        self.log_visible = not self.log_visible
+        if self.log_visible:
+            self.progress_bar.show()
+            self.scroll_win.show()
+            self.toggle_btn.set_label("Hide Log")
+        else:
+            self.progress_bar.hide()
+            self.scroll_win.hide()
+            self.toggle_btn.set_label("Show Log")
+
     def on_cancel_clicked(self, button):
         if self.process:
             try:
@@ -144,8 +160,6 @@ class YtDlpGUI(Gtk.ApplicationWindow):
     def log_status(self, message, replace_last=False):
         buf = self.status_view.get_buffer()
         if replace_last:
-            start = buf.get_start_iter()
-            end = buf.get_end_iter()
             buf.set_text(message)
         else:
             end = buf.get_end_iter()
@@ -209,7 +223,7 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             fmt_id = parts[0].split()[0]
             label = " | ".join(parts)
             if "video only" in label.lower():
-                continue  # 🚫 skip video-only
+                continue  # skip video-only
             all_formats.append({'id': fmt_id, 'label': label})
         return all_formats
 
