@@ -18,13 +18,11 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         self.set_border_width(10)
 
         self.process = None
-        self.download_thread = None
         self.all_formats = []
         self.is_video_mode = True
 
         self.setup_ui()
 
-    # ---------------- UI SETUP ----------------
     def setup_ui(self):
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.add(main_box)
@@ -53,11 +51,11 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
         # Format dropdown
         fmt_label = Gtk.Label(label="Available Formats:", xalign=0)
-        self.v_format_combo = Gtk.ComboBoxText()
-        self.v_format_combo.append("none", "Fetch a URL first...")
-        self.v_format_combo.set_active_id("none")
+        self.format_combo = Gtk.ComboBoxText()
+        self.format_combo.append("none", "Fetch a URL first...")
+        self.format_combo.set_active_id("none")
         main_box.pack_start(fmt_label, False, False, 0)
-        main_box.pack_start(self.v_format_combo, False, False, 0)
+        main_box.pack_start(self.format_combo, False, False, 0)
 
         # Download location
         loc_label = Gtk.Label(label="Download Location:", xalign=0)
@@ -70,18 +68,6 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         loc_box.pack_start(browse_btn, False, False, 0)
         main_box.pack_start(loc_label, False, False, 0)
         main_box.pack_start(loc_box, False, False, 0)
-
-        # Options
-        opt_box = Gtk.Box(spacing=10)
-        self.subs_check = Gtk.CheckButton(label="Download Subtitles")
-        self.embed_check = Gtk.CheckButton(label="Embed Subtitles")
-        self.playlist_check = Gtk.CheckButton(label="Download Playlist")
-        self.thumb_check = Gtk.CheckButton(label="Embed Thumbnail (Audio only)")
-        opt_box.pack_start(self.subs_check, False, False, 0)
-        opt_box.pack_start(self.embed_check, False, False, 0)
-        opt_box.pack_start(self.playlist_check, False, False, 0)
-        opt_box.pack_start(self.thumb_check, False, False, 0)
-        main_box.pack_start(opt_box, False, False, 0)
 
         # Progress + log
         progress_label = Gtk.Label(label="Progress:", xalign=0)
@@ -110,7 +96,6 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
         self.show_all()
 
-    # ---------------- HELPERS ----------------
     def log_status(self, message, replace_last=False):
         buf = self.status_view.get_buffer()
         if replace_last:
@@ -121,30 +106,20 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         buf.insert(end, message + "\n")
         self.status_view.scroll_to_iter(buf.get_end_iter(), 0.0, True, 0.0, 1.0)
 
-    def show_error(self, msg):
-        dlg = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            text=msg,
-        )
-        dlg.run()
-        dlg.destroy()
-        self.log_status(f"[ERROR] {msg}")
+    def on_type_changed(self, combo):
+        self.is_video_mode = combo.get_active_id() == "video"
 
-    # ---------------- FETCH FORMATS ----------------
     def on_fetch_formats(self, button):
         url = self.url_entry.get_text().strip()
         if not url:
-            self.show_error("Please enter a URL.")
+            self.log_status("[ERROR] Please enter a URL.")
             return
 
         self.fetch_btn.set_sensitive(False)
         self.fetch_btn.set_label("Fetching...")
-        self.v_format_combo.remove_all()
-        self.v_format_combo.append("loading", "Fetching formats...")
-        self.v_format_combo.set_active_id("loading")
+        self.format_combo.remove_all()
+        self.format_combo.append("loading", "Fetching formats...")
+        self.format_combo.set_active_id("loading")
 
         threading.Thread(target=self.fetch_formats_thread, args=(url,), daemon=True).start()
 
@@ -157,19 +132,18 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
             if stderr.strip():
                 GLib.idle_add(self.log_status, f"[yt-dlp][stderr] {stderr.strip()}")
+
             if not stdout.strip():
                 GLib.idle_add(self.log_status, "[WARN] No output received from yt-dlp")
                 return
 
             formats = self.parse_formats(stdout)
             self.all_formats = formats
-            GLib.idle_add(self.update_format_dropdown_by_type)
+            GLib.idle_add(self.update_format_dropdown)
             GLib.idle_add(self.log_status, f"[INFO] Found {len(formats)} formats")
 
         except subprocess.TimeoutExpired:
             GLib.idle_add(self.log_status, "[ERROR] Timeout fetching formats")
-        except FileNotFoundError:
-            GLib.idle_add(self.log_status, "[ERROR] yt-dlp not found (install with pip)")
         except Exception as e:
             GLib.idle_add(self.log_status, f"[ERROR][FetchThread] {e}")
         finally:
@@ -178,9 +152,7 @@ class YtDlpGUI(Gtk.ApplicationWindow):
 
     def parse_formats(self, text):
         formats = []
-        pattern = re.compile(
-            r"^(?P<id>[0-9a-zA-Z\-_]+)\s+(?P<ext>\w+)\s+(?P<details>.+)$"
-        )
+        pattern = re.compile(r"^(?P<id>[0-9a-zA-Z\-_]+)\s+(?P<ext>\w+)\s+(?P<details>.+)$")
         for line in text.splitlines():
             m = pattern.match(line.strip())
             if not m:
@@ -188,64 +160,39 @@ class YtDlpGUI(Gtk.ApplicationWindow):
             fmt_id = m.group("id")
             ext = m.group("ext")
             details = m.group("details")
-            line_lower = details.lower()
-            ftype = "audio" if "audio only" in line_lower or "audio" in line_lower else "video"
             label = f"{fmt_id} - {ext.upper()} - {details}"
-            formats.append({"id": fmt_id, "type": ftype, "label": label})
+            formats.append({"id": fmt_id, "label": label})
         return formats
 
-    def update_format_dropdown_by_type(self):
-        self.v_format_combo.remove_all()
+    def update_format_dropdown(self):
+        self.format_combo.remove_all()
 
         if not self.all_formats:
-            self.v_format_combo.append("none", "No formats found")
-            self.v_format_combo.set_active_id("none")
+            self.format_combo.append("none", "No formats found")
+            self.format_combo.set_active_id("none")
             return
 
-        filtered = [
-            f for f in self.all_formats if f["type"] == ("video" if self.is_video_mode else "audio")
-        ]
-        if not filtered:
-            self.v_format_combo.append("none", "No matching formats")
-            self.v_format_combo.set_active_id("none")
-            return
+        for f in self.all_formats:
+            self.format_combo.append(f["id"], f["label"])
+        self.format_combo.set_active(0)
 
-        # Sort “best” and by resolution
-        filtered.sort(key=lambda f: (
-            0 if "best" in f["id"] else 1,
-            -int(re.search(r"(\d{3,4})p", f["label"]).group(1)) if re.search(r"(\d{3,4})p", f["label"]) else 0
-        ))
-
-        for f in filtered:
-            self.v_format_combo.append(f["id"], f["label"])
-        self.v_format_combo.set_active(0)
-
-    def on_type_changed(self, combo):
-        self.is_video_mode = combo.get_active_id() == "video"
-        self.update_format_dropdown_by_type()
-
-    # ---------------- DOWNLOAD ----------------
     def on_download_clicked(self, button):
         url = self.url_entry.get_text().strip()
         if not url:
-            self.show_error("Please enter a URL before downloading.")
+            self.log_status("[ERROR] Please enter a URL before downloading.")
             return
         threading.Thread(target=self.download_thread_fn, args=(url,), daemon=True).start()
 
     def build_download_cmd(self, url):
         cmd = ["yt-dlp"]
         loc = self.location_entry.get_text().strip() or str(Path.home() / "Downloads")
-        fmt_id = self.v_format_combo.get_active_id()
+        fmt_id = self.format_combo.get_active_id()
         if fmt_id and fmt_id not in ("none", "loading"):
             cmd += ["-f", fmt_id]
-        if self.subs_check.get_active():
-            cmd.append("--write-subs")
-        if self.embed_check.get_active():
-            cmd.append("--embed-subs")
-        if self.playlist_check.get_active():
-            cmd.append("-i")
-        if not self.is_video_mode and self.thumb_check.get_active():
-            cmd.append("--embed-thumbnail")
+
+        if not self.is_video_mode:
+            cmd += ["--extract-audio"]
+
         cmd += ["-o", os.path.join(loc, "%(title)s.%(ext)s"), url]
         return cmd
 
@@ -282,7 +229,6 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         finally:
             self.process = None
 
-    # ---------------- OTHER HANDLERS ----------------
     def on_browse_clicked(self, button):
         dlg = Gtk.FileChooserDialog(
             title="Select Download Location", parent=self,
