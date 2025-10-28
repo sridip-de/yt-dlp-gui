@@ -219,6 +219,14 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         """Build yt-dlp command based on settings"""
         cmd = ["yt-dlp"]
         
+        # Add necessary options for reliability
+        cmd.extend([
+            "--no-warnings",
+            "-R", "5",  # Retry 5 times
+            "--socket-timeout", "30",
+            "--extractor-args", "youtube:player_client=web"
+        ])
+        
         if self.playlist_check.get_active():
             cmd.append("-i")
         
@@ -238,13 +246,13 @@ class YtDlpGUI(Gtk.ApplicationWindow):
         else:
             quality = self.quality_combo.get_active_id()
             if quality == "best":
-                cmd.extend(["-f", "bestvideo*+bestaudio/best"])
+                cmd.extend(["-f", "bv*+ba/b"])
             else:
-                cmd.extend(["-f", f"bestvideo[height<={quality}]+bestaudio/best"])
+                cmd.extend(["-f", f"bv*[height<={quality}]+ba/b"])
             
             v_format = self.v_format_combo.get_active_id()
             if v_format != "best":
-                cmd.extend(["--remux-video", v_format])
+                cmd.extend(["--merge-output-format", v_format])
         
         if self.subtitle_check.get_active():
             cmd.append("--write-subs")
@@ -267,9 +275,13 @@ class YtDlpGUI(Gtk.ApplicationWindow):
                 universal_newlines=True, bufsize=1
             )
             
+            has_error = False
             for line in self.process.stdout:
                 line = line.rstrip()
                 GLib.idle_add(self.log_status, line)
+                
+                if line.startswith("ERROR"):
+                    has_error = True
                 
                 if "%" in line and "ETA" in line:
                     try:
@@ -279,8 +291,12 @@ class YtDlpGUI(Gtk.ApplicationWindow):
                         pass
             
             self.process.wait()
-            GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
-            GLib.idle_add(self.progress_bar.set_fraction, 1.0)
+            if self.process.returncode == 0 and not has_error:
+                GLib.idle_add(self.log_status, "[SUCCESS] Download completed!")
+                GLib.idle_add(self.progress_bar.set_fraction, 1.0)
+            else:
+                GLib.idle_add(self.log_status, "[FAILED] Download encountered errors. Check output above.")
+                GLib.idle_add(self.progress_bar.set_fraction, 0)
             
         except FileNotFoundError:
             GLib.idle_add(self.show_error, "yt-dlp not found. Install: pip install yt-dlp")
